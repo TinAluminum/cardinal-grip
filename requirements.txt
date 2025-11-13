@@ -2,3 +2,4 @@ streamlit
 websocket-client
 pandas
 plotly
+pyserial 

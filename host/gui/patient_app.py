@@ -1,178 +1,87 @@
-# gui/patient_app.py
+# host/gui/patient_app.py
 
 import os
+import sys
 import time
-from datetime import datetime
+from collections import deque
 
-import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
-from websocket import create_connection, WebSocketConnectionClosedException
 
-st.set_page_config(page_title="Cardinal Grip – Patient GUI", layout="wide")
+# Add parent folder ("host") to import path
+ROOT = os.path.dirname(os.path.dirname(__file__))
+if ROOT not in sys.path:
+    sys.path.append(ROOT)
 
-st.title("Cardinal Grip – Patient Training")
-
-st.markdown(
-    "This page shows **live finger pressures** from the ESP32 grip ball and "
-    "records a rehab session for later clinician review."
-)
-
-# --- Sidebar controls ---------------------------------------------------------
-
-default_uri = "ws://192.168.4.1/ws"  # change if your ESP32 IP/route is different
-ws_uri = st.sidebar.text_input("ESP32 WebSocket URL", default_uri)
-
-threshold = st.sidebar.number_input(
-    "Training threshold (ADC units, 0–4095)", min_value=0, max_value=4095, value=2000
-)
-
-session_duration = st.sidebar.number_input(
-    "Max session duration (seconds)", min_value=5, max_value=600, value=120
-)
-
-col_start, col_stop = st.sidebar.columns(2)
-
-if "running" not in st.session_state:
-    st.session_state.running = False
-
-if col_start.button("Start session"):
-    st.session_state.running = True
-if col_stop.button("Stop session"):
-    st.session_state.running = False
-
-# --- Placeholders for dynamic UI ---------------------------------------------
-
-status_box = st.empty()
-plot_box = st.empty()
-info_box = st.empty()
-
-# Ensure data directory exists
-os.makedirs("data", exist_ok=True)
+from fsr_reader import FSRReader  # noqa: E402
 
 
-def run_session():
-    """Connect to ESP32 WebSocket and stream a single rehab session."""
+def main():
+    st.set_page_config(page_title="Cardinal Grip – Patient GUI", layout="centered")
+    st.title("Cardinal Grip – Patient View")
 
-    try:
-        ws = create_connection(ws_uri, timeout=5)
-    except Exception as e:
-        status_box.error(f"Failed to connect to {ws_uri}: {e}")
-        st.session_state.running = False
-        return
+    port = st.sidebar.text_input("Serial port", "/dev/cu.usbserial-0001")
+    baud = st.sidebar.number_input("Baud rate", value=115200, step=1200)
+    target_min = st.sidebar.slider("Target band (min)", 0, 4095, 1200)
+    target_max = st.sidebar.slider("Target band (max)", 0, 4095, 2000)
 
-    status_box.success(f"Connected to {ws_uri}")
-    data_rows = []
-    start_time = time.time()
-    presses_over_threshold = 0
+    # --- session state setup ---
+    if "reader" not in st.session_state:
+        st.session_state["reader"] = None
+    if "values" not in st.session_state:
+        # keep only the most recent 200 samples
+        st.session_state["values"] = deque(maxlen=200)
 
-    try:
-        while st.session_state.running:
-            # Stop if session exceeds max duration
-            t = time.time() - start_time
-            if t > session_duration:
-                status_box.warning("Max session duration reached – stopping.")
-                break
+    col1, col2 = st.columns(2)
+    status_placeholder = col1.empty()
+    value_placeholder = col2.empty()
+    chart_placeholder = st.empty()
+    band_info = st.empty()
 
-            try:
-                msg = ws.recv()  # blocking read
-            except WebSocketConnectionClosedException:
-                status_box.error("WebSocket connection closed by ESP32.")
-                break
-            except Exception as e:
-                status_box.error(f"WebSocket error: {e}")
-                break
+    start = st.button("Start")
+    stop = st.button("Stop")
 
-            msg = msg.strip()
-            if not msg:
-                continue
+    # --- connect / disconnect controls ---
+    if start and st.session_state["reader"] is None:
+        try:
+            st.session_state["reader"] = FSRReader(port=port, baud=baud)
+            status_placeholder.success(f"Connected to {port} at {baud} baud.")
+        except Exception as e:
+            status_placeholder.error(f"Failed to open {port}: {e}")
+            st.session_state["reader"] = None
 
-            # Expect e.g. "1500,2147,2473,2659"
-            try:
-                vals = [int(x) for x in msg.split(",")]
-            except ValueError:
-                # Skip malformed line
-                status_box.warning(f"Received malformed message: {msg}")
-                continue
+    if stop and st.session_state["reader"] is not None:
+        st.session_state["reader"].close()
+        st.session_state["reader"] = None
+        status_placeholder.info("Stopped streaming.")
 
-            timestamp = t
-            row = [timestamp] + vals
-            data_rows.append(row)
+    reader = st.session_state["reader"]
 
-            # Convert to DataFrame for plotting
-            n_fingers = len(vals)
-            col_names = ["time"] + [f"F{i+1}" for i in range(n_fingers)]
-            df = pd.DataFrame(data_rows, columns=col_names)
+    # --- streaming loop ---
+    if reader is not None:
+        band_info.markdown(
+            f"Target band: **{target_min}–{target_max}** ADC units. "
+            "Try to hold your squeeze in this range."
+        )
 
-            # Count "press" if any finger crosses threshold
-            if any(v >= threshold for v in vals):
-                presses_over_threshold += 1
+        for _ in range(20):  # small loop each rerun
+            val = reader.read()
+            if val is not None:
+                st.session_state["values"].append(val)
 
-            # Build plot
-            fig = go.Figure()
-            for i in range(n_fingers):
-                col = f"F{i+1}"
-                fig.add_trace(
-                    go.Scatter(
-                        x=df["time"],
-                        y=df[col],
-                        mode="lines",
-                        name=col,
-                    )
-                )
+                value_placeholder.metric("Current force (ADC units)", val)
 
-            # Threshold line
-            fig.add_hline(
-                y=threshold, line_dash="dash", line_color="red", annotation_text="Threshold"
-            )
+                if target_min <= val <= target_max:
+                    status_placeholder.success("In target zone ✅")
+                else:
+                    status_placeholder.warning("Outside target zone")
 
-            fig.update_layout(
-                xaxis_title="Time (s)",
-                yaxis_title="Raw ADC (0–4095)",
-                height=450,
-                margin=dict(l=40, r=20, t=40, b=40),
-            )
+                chart_placeholder.line_chart(list(st.session_state["values"]))
 
-            plot_box.plotly_chart(fig, use_container_width=True)
-
-            # Status text
-            latest = ", ".join(str(v) for v in vals)
-            info_box.markdown(
-                f"""
-                **Elapsed:** {timestamp:5.1f} s  
-                **Latest ADCs:** {latest}  
-                **Press events ≥ threshold:** {presses_over_threshold}
-                """
-            )
-
-            # Small sleep to avoid hammering Streamlit
             time.sleep(0.05)
 
-            # Let Streamlit see button changes
-            if not st.session_state.running:
-                break
-
-    finally:
-        try:
-            ws.close()
-        except Exception:
-            pass
-
-    # Save session if we collected data
-    if data_rows:
-        col_names = ["time"] + [f"F{i+1}" for i in range(len(data_rows[0]) - 1)]
-        df = pd.DataFrame(data_rows, columns=col_names)
-        filename = datetime.now().strftime("data/session_%Y%m%d_%H%M%S.csv")
-        df.to_csv(filename, index=False)
-        status_box.success(f"Session saved to **{filename}**")
-    else:
-        status_box.warning("No data collected; nothing saved.")
-
-    # Reset running flag
-    st.session_state.running = False
+        # 🔁 trigger another pass to keep streaming
+        st.rerun()
 
 
-if st.session_state.running:
-    run_session()
-else:
-    status_box.info("Press **Start session** in the sidebar to begin streaming data.")
+if __name__ == "__main__":
+    main()
